@@ -16,7 +16,17 @@ the exact regressions that were fixed:
   view;
 * switching to a project (including an empty one) clears the previous
   project's channels immediately, and a failed eval of the current
-  project clears the stale readouts; a failed save must touch neither.
+  project clears the stale readouts; a failed save must touch neither;
+* rapid project switching is sequenced: every ``openProject`` call takes
+  a monotonically increasing ticket and only the latest ticket may apply
+  its ``GET /api/projects/{id}`` response (a project-id comparison cannot
+  spot the stale request in A→B→A); a superseded detail response —
+  success or failure — must leave the page untouched, while the latest
+  selection's failure must surface a toast and roll the context back to
+  the project still on screen so no mismatched readouts can be shown;
+  and ``requestEval`` only evaluates the project whose detail is actually
+  displayed, so an eval fired while a switch is in flight can never paint
+  the next project's channels onto the previous project's lanes.
 """
 
 import re
@@ -198,6 +208,80 @@ class TestEvalDataGeneration(unittest.TestCase):
         self.assertNotIn("applyProjectPayload", err)
         self.assertNotIn("evalGen", err)
         self.assertNotIn("readouts = null", err)
+
+
+class TestProjectDetailSequencing(unittest.TestCase):
+    """Rapid project switching: only the latest detail request may apply.
+
+    Switching projects before the previous GET /api/projects/{id} returned
+    must never let a late response rebuild the lanes for a project the user
+    has already left; the page may only ever show the last-selected project
+    together with the readouts evaluated for it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = APP_JS.read_text(encoding="utf-8")
+        cls.flat = re.sub(r"\s+", " ", cls.src)
+        cls.open = function_body(cls.src, "async function openProject(id)")
+        cls.req = function_body(cls.src, "async function requestEval(immediate)")
+
+    def test_open_sequence_state_exists(self):
+        # a monotonic ticket lives next to the eval generation counter —
+        # project id alone cannot identify the stale request in A→B→A
+        self.assertIn("openSeq: 0", self.flat)
+
+    def test_open_takes_ticket_before_request(self):
+        self.assertIn("const seq = ++state.openSeq;", self.open)
+        ticket = self.open.index("const seq = ++state.openSeq;")
+        sent = self.open.index("await api(")
+        self.assertLess(ticket, sent)
+
+    def test_stale_detail_success_discarded_before_apply(self):
+        # after the await the ticket is re-checked; a superseded response
+        # returns without touching state.project or rebuilding the lanes
+        sent = self.open.index("await api(")
+        guard = self.open.index("if (seq !== state.openSeq) return;", sent)
+        apply_at = self.open.index("state.project = payload;")
+        self.assertLess(sent, guard)
+        self.assertLess(guard, apply_at)
+        self.assertLess(guard, self.open.index("buildLanes();"))
+
+    def test_stale_detail_failure_leaves_page_untouched(self):
+        # the catch must bail out on a superseded ticket BEFORE any state
+        # mutation or toast: a stale failure changes nothing on screen
+        catch = self.open.split("} catch (e) {", 1)[1]
+        bail = catch.index("if (seq !== state.openSeq) return;")
+        self.assertLess(bail, catch.index("toast("))
+        stale_prefix = catch[:bail]
+        self.assertNotIn("state.project", stale_prefix)
+        self.assertNotIn("toast(", stale_prefix)
+
+    def test_latest_detail_failure_toasts_and_restores_context(self):
+        # the latest selection's failure must surface the error and roll
+        # the context back to the project still on screen, so the selector,
+        # the lanes and every later eval keep describing the same project
+        # and no mismatched readouts can appear
+        catch = self.open.split("} catch (e) {", 1)[1]
+        self.assertIn("toast(e.message);", catch)
+        self.assertIn("state.projectId = state.project", catch)
+        # the selector follows the rollback so re-selecting the failed
+        # project fires `change` again
+        self.assertIn('$("#projectSelect").value', catch)
+
+    def test_eval_only_for_displayed_project(self):
+        # while a switch is in flight (or its load failed) projectId points
+        # at a project whose detail is not on screen: never evaluate it,
+        # its channels would land on the previous project's lanes
+        guard = self.req.index("state.project.id !== state.projectId")
+        self.assertLess(guard, self.req.index("const tq = state.time;"))
+
+    def test_valid_detail_still_triggers_live_eval(self):
+        # the applied detail is what settles the readouts on the current
+        # instant of the last-selected project
+        apply_at = self.open.index("state.project = payload;")
+        eval_at = self.open.index("await requestEval(true);")
+        self.assertLess(apply_at, eval_at)
 
 
 if __name__ == "__main__":

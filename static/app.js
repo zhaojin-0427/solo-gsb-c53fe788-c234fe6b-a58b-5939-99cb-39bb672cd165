@@ -28,6 +28,11 @@ const state = {
   // playhead instant in a different project or after an edit needs a fresh
   // /eval, never a cached readout taken from the old data.
   evalGen: 0,
+  // Monotonic ticket handed out by openProject: only the call holding the
+  // latest ticket may apply its detail response.  Comparing project ids
+  // cannot spot a stale detail request — in A→B→A the first A response
+  // carries the same id as the live request — but this sequence number can.
+  openSeq: 0,
   // cache key of the readouts currently shown: `${projectId}|${gen}|${time}`;
   // null means no readout may be reused yet (e.g. current eval failed)
   readoutKey: null,
@@ -116,12 +121,41 @@ async function loadProjects(selectId) {
 }
 
 async function openProject(id) {
+  // Take the next detail-request ticket: only the call still holding the
+  // latest ticket is valid and may apply its response.  A project-id
+  // comparison is not enough — in A→B→A the first A request carries the
+  // same id as the live one, yet its older response must be discarded.
+  const seq = ++state.openSeq;
   // invalidate any eval belonging to the previously open project: a
   // response still in flight must be discarded rather than shown here
   state.projectId = id;
   state.evalGen += 1;
   localStorage.setItem("lightsProject", id);
-  state.project = await api(`/api/projects/${id}`);
+  let payload;
+  try {
+    payload = await api(`/api/projects/${id}`);
+  } catch (e) {
+    // a superseded request — success or failure — must leave the current
+    // page untouched: the user has already moved on to another project
+    if (seq !== state.openSeq) return;
+    // The latest selection failed to load.  Roll the context back to the
+    // project still on screen so the lanes, the editor, the selector and
+    // every later eval keep describing the same project — the failure
+    // must not leave mismatched readouts behind — then surface the error.
+    state.projectId = state.project ? state.project.id : null;
+    if (state.projectId == null) {
+      localStorage.removeItem("lightsProject");
+    } else {
+      localStorage.setItem("lightsProject", state.projectId);
+      $("#projectSelect").value = String(state.projectId);
+    }
+    toast(e.message);
+    return;
+  }
+  // a newer selection superseded this request while it was in flight:
+  // discard the late response instead of rebuilding the lanes with it
+  if (seq !== state.openSeq) return;
+  state.project = payload;
   state.selectedId = null;
   buildLanes();
   // clear readouts from the old project before re-evaluating so switching
@@ -131,6 +165,10 @@ async function openProject(id) {
   renderReadouts();
   renderTimeline();
   renderEditor();
+  // evaluate the live playhead instant against the project just applied:
+  // eval requests made while the detail was in flight were held back (see
+  // requestEval), so this is what settles the readouts on the current
+  // instant of the last-selected project
   await requestEval(true);
 }
 
@@ -395,6 +433,12 @@ function updateClockAndHead() {
 }
 
 async function requestEval(immediate) {
+  // Only evaluate the project whose detail is actually on screen.  While a
+  // switch is still in flight — or its detail request failed — projectId
+  // already points at the next project, and evaluating it here would paint
+  // its channels onto the lanes of the project still displayed.  The valid
+  // detail response re-runs this for the live instant as soon as it lands.
+  if (!state.project || state.project.id !== state.projectId) return;
   // the playhead is an arbitrary non-negative (possibly fractional) ms
   // value; send it verbatim — no rounding anywhere in the chain, so the
   // readout always matches a direct /eval call for this exact instant
