@@ -32,6 +32,16 @@ const state = {
   // null means no readout may be reused yet (e.g. current eval failed)
   readoutKey: null,
   dragging: false,
+  // Monotonic token of project-detail fetches.  Project ids alone cannot
+  // tell which of two GET /api/projects/:id requests is current when the
+  // user switches A→B→A: the late response of the *earlier* A request
+  // carries the same id as the live selection, so every detail response is
+  // checked against this sequence and discarded unless it is the newest.
+  detailSeq: 0,
+  // true while the newest selection's detail is still in flight; eval must
+  // wait for it (a value fetched meanwhile could only belong to another
+  // project and would be rendered onto the wrong lanes).
+  detailLoading: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -116,12 +126,57 @@ async function loadProjects(selectId) {
 }
 
 async function openProject(id) {
-  // invalidate any eval belonging to the previously open project: a
-  // response still in flight must be discarded rather than shown here
+  // Claim a new selection.  invalidate any eval belonging to the previous
+  // context: a response still in flight must be discarded rather than shown
+  // here.  The sequence token (not the project id) identifies this fetch as
+  // the newest one — required because a late response from an earlier fetch
+  // of the *same* project (A→B→A) would otherwise look current.
   state.projectId = id;
   state.evalGen += 1;
   localStorage.setItem("lightsProject", id);
-  state.project = await api(`/api/projects/${id}`);
+  const seq = ++state.detailSeq;
+  state.detailLoading = true;
+
+  // While this detail is pending, requestEval returns without requesting:
+  // state.project / lanes may still describe the previously open project,
+  // and an eval arriving meanwhile could only be rendered against them.
+  let detail;
+  try {
+    detail = await api(`/api/projects/${id}`);
+  } catch (e) {
+    if (seq !== state.detailSeq) {
+      // stale failure: a newer selection is already being opened (or has
+      // finished); neither the error nor anything else may touch the page
+      return;
+    }
+    // The newest selection failed to load.  Drop lanes/editor/readouts so no
+    // mismatched data can be shown (lanes belong to the previously open
+    // project, readouts to whatever request settled last), and surface the
+    // error.  readoutKey stays null so the next selection is never deduped.
+    state.detailLoading = false;
+    state.project = null;
+    state.lanes = [];
+    state.laneKeys = [];
+    state.selectedId = null;
+    state.readouts = null;
+    state.readoutKey = null;
+    renderReadouts();
+    renderTimeline();
+    renderEditor();
+    toast(e.message);
+    return;
+  }
+
+  if (seq !== state.detailSeq) {
+    // A newer selection happened while this request was in flight.  Its
+    // success (the failure case is handled above) must not write
+    // state.project, rebuild lanes or trigger an eval; whichever
+    // openProject owns detailSeq owns the page.
+    return;
+  }
+
+  state.detailLoading = false;
+  state.project = detail;
   state.selectedId = null;
   buildLanes();
   // clear readouts from the old project before re-evaluating so switching
@@ -131,6 +186,8 @@ async function openProject(id) {
   renderReadouts();
   renderTimeline();
   renderEditor();
+  // detail is now applied: evaluate the newest project at the current
+  // playhead instant (evals were skipped while the detail was pending)
   await requestEval(true);
 }
 
@@ -172,6 +229,9 @@ function niceStep(span) {
 function renderTimeline() {
   const host = $("#timeline");
   host.innerHTML = "";
+  // nothing drawable: the newest detail failed (during a pending load the
+  // previous project's SVG simply stays on screen until the new one lands)
+  if (!state.project) return;
 
   const w = state.labelW + state.headPad * 2 + state.timeMax * state.pxPerMs;
   const axisH = 28;
@@ -297,7 +357,8 @@ function refAncestors(item) {
   const out = [];
   let cur = item;
   const seen = new Set();
-  while (cur && cur.start_mode === "ref" && !seen.has(cur.ref_id)) {
+  while (cur && cur.start_mode === "ref" && !seen.has(cur.ref_id) &&
+         state.project) {
     seen.add(cur.ref_id);
     out.push(cur.ref_id);
     cur = state.project.items.find((q) => q.id === cur.ref_id);
@@ -405,6 +466,11 @@ async function requestEval(immediate) {
   // instant.  Same time after a project switch or a successful edit bumps
   // the generation, so the old readout can never be served again.
   const key = `${pid}|${gen}|${tq}`;
+  // No project view to evaluate yet (the newest detail is still loading, or
+  // the newest load failed): skip entirely.  openProject evaluates once its
+  // detail is applied, so nothing must be sent against another project's
+  // lanes in the meantime, and nothing is queued behind it.
+  if (state.detailLoading || !state.project) return;
   // one in-flight request at a time; remember to re-run afterwards (the
   // re-run re-reads project/gen/time so it always evaluates the current
   // data, even if it changed while the request was in flight).  This must
@@ -486,7 +552,7 @@ async function requestEval(immediate) {
 function renderReadouts() {
   const host = $("#readouts");
   host.innerHTML = "";
-  if (!state.readouts) return;
+  if (!state.readouts || !state.project) return;
   const byKey = new Map(state.readouts.channels.map((c) =>
     [`${c.fixture}|${c.channel}`, c]));
   for (const lane of state.lanes) {
@@ -518,7 +584,8 @@ function renderReadouts() {
 }
 
 function itemById(id) {
-  return state.project.items.find((i) => i.id === id);
+  return state.project
+    ? state.project.items.find((i) => i.id === id) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +616,13 @@ function blankForm() {
 function renderEditor() {
   const host = $("#editor");
   host.innerHTML = "";
+  // newest detail failed to load (or is still pending): no form can be built
+  if (!state.project) {
+    $("#editorTitle").textContent = "提示项";
+    host.appendChild(el("div", { class: "empty-note" },
+      "当前工程详情不可用，请在上方重新选择工程。"));
+    return;
+  }
   const it = currentSelected();
   $("#editorTitle").textContent = it ? `提示项 #${it.id}` : "新建提示项";
 
@@ -793,7 +867,10 @@ async function init() {
   $("#jumpBtn").addEventListener("click", doJump);
   $("#jumpInput").addEventListener("keydown", (e) => { if (e.key === "Enter") doJump(); });
 
-  window.addEventListener("resize", () => { buildLanes(); renderTimeline(); updateClockAndHead(); });
+  window.addEventListener("resize", () => {
+    if (!state.project) return;
+    buildLanes(); renderTimeline(); updateClockAndHead();
+  });
 }
 
 function doJump() {
